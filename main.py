@@ -2,6 +2,9 @@
 """
 notion-fsrs: Query LeetCode problems from Notion, rank by FSRS priority, and set daily review items.
 
+On each run it reads "Last Reviewed" + "Score" from the Problems DB, auto-syncs any
+new reviews into the Reviews DB, then uses full FSRS to determine what to study today.
+
 Usage:
     uv run python main.py              # Default: select top 3, update Status to "To Do"
     uv run python main.py --dry-run    # Print without updating Notion
@@ -14,31 +17,33 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fsrs import Rating
+from fsrs import Card, Rating, ReviewLog, Scheduler
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DATABASE_ID = "bc4026a6449247e48b5445758bcdad5f"
+PROBLEMS_DB_ID = "bc4026a6449247e48b5445758bcdad5f"
+REVIEWS_DB_ID = "3ad974f8b66a80eca299e6c937c3a6bc"
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 PAGE_SIZE = 100
 
-# Map captain's Notion scores to FSRS quality ratings.
 SCORE_TO_RATING: dict[str, Rating] = {
-    "FAILED": Rating.Again,   # 0 -> Again
-    "1": Rating.Hard,         # 1 -> Hard
-    "2": Rating.Good,         # 2 -> Good
-    "3": Rating.Easy,         # 3,4,5 -> Easy
+    "FAILED": Rating.Again,
+    "1": Rating.Hard,
+    "2": Rating.Good,
+    "3": Rating.Easy,
     "4": Rating.Easy,
     "5": Rating.Easy,
 }
+
+_fsrs = Scheduler(desired_retention=0.9)
 
 
 # ---------------------------------------------------------------------------
@@ -46,28 +51,23 @@ SCORE_TO_RATING: dict[str, Rating] = {
 # ---------------------------------------------------------------------------
 
 @dataclass
-class NotionPage:
-    """A single problem page from the Notion database."""
+class Problem:
+    """A single LeetCode problem from the Notion database."""
     page_id: str
     title: str
-    score_label: str          # e.g. "FAILED", "1", "2", "3", "4", "5"
-    status: str               # e.g. "To Do", "spaced_repetition", ...
-    times_done: int | None
-    last_edited: datetime     # from last_edited_time property
-    link_text: str            # LeetCode URL (may be empty)
-
-    @property
-    def fsrs_rating(self) -> Rating | None:
-        """Convert Notion score to FSRS rating."""
-        return SCORE_TO_RATING.get(self.score_label)
+    status: str
+    score_label: str              # e.g. "FAILED", "1" .. "5"
+    last_reviewed: date | None    # from "Last Reviewed" property
+    link_text: str
 
 
 @dataclass(order=True)
 class RankedCard:
-    """A card with computed priority for sorting."""
-    priority_score: float          # Higher = more urgent review needed
-    page: NotionPage = field(compare=False)
-    days_since_review: int | None = field(compare=False, default=None)
+    """A problem with computed FSRS state and review priority."""
+    priority_score: float         # Higher = more urgent
+    card: Card = field(compare=False)
+    problem: Problem = field(compare=False)
+    review_count: int = field(compare=False, default=0)
 
 
 # ---------------------------------------------------------------------------
@@ -82,18 +82,16 @@ def _headers(api_key: str) -> dict[str, str]:
     }
 
 
-def fetch_all_pages(api_key: str, timeout: float = 30.0) -> list[dict[str, Any]]:
-    """Query the Notion database and return all page results (handles pagination)."""
-    url = f"{NOTION_API_BASE}/databases/{DATABASE_ID}/query"
+def fetch_all_pages(api_key: str, db_id: str, timeout: float = 30.0) -> list[dict[str, Any]]:
+    """Query a Notion database and return all page results (handles pagination)."""
+    url = f"{NOTION_API_BASE}/databases/{db_id}/query"
     headers = _headers(api_key)
     all_results: list[dict[str, Any]] = []
 
     cursor: str | None = None
     with httpx.Client(headers=headers, timeout=timeout) as client:
         while True:
-            body: dict[str, Any] = {
-                "page_size": PAGE_SIZE,
-            }
+            body: dict[str, Any] = {"page_size": PAGE_SIZE}
             if cursor:
                 body["start_cursor"] = cursor
 
@@ -102,31 +100,47 @@ def fetch_all_pages(api_key: str, timeout: float = 30.0) -> list[dict[str, Any]]
             data = resp.json()
 
             all_results.extend(data.get("results", []))
-            has_more = data.get("has_more", False)
-            next_cursor = data.get("next_cursor")
-
-            if not has_more or not next_cursor:
+            if not data.get("has_more", False):
                 break
-            cursor = next_cursor
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
 
     return all_results
 
 
-def update_page_status(api_key: str, page_id: str, status: str = "To Do") -> None:
-    """Update a page's Status property via Notion Update Page API."""
+def update_page_status(api_key: str, page_id: str, status: str) -> None:
+    """Update a page's Status property."""
     url = f"{NOTION_API_BASE}/pages/{page_id}"
-    headers = _headers(api_key)
+    payload = {"properties": {"Status": {"select": {"name": status}}}}
 
-    payload: dict[str, Any] = {
+    with httpx.Client(headers=_headers(api_key), timeout=30.0) as client:
+        resp = client.patch(url, json=payload)
+        resp.raise_for_status()
+
+
+def create_review_entry(
+    api_key: str,
+    problem_id: str,
+    score_label: str,
+    review_date: date,
+) -> None:
+    """Create a new review entry in the Reviews DB."""
+    today_str = review_date.isoformat()
+    payload = {
+        "parent": {"database_id": REVIEWS_DB_ID},
         "properties": {
-            "Status": {
-                "select": {"name": status}
-            }
-        }
+            "Title": {
+                "title": [{"text": {"content": f"Review - {today_str}"}}]
+            },
+            "Leetcode": {"relation": [{"id": problem_id}]},
+            "Date": {"date": {"start": today_str}},
+            "Select": {"select": {"name": score_label}},
+        },
     }
 
-    with httpx.Client(headers=headers, timeout=30.0) as client:
-        resp = client.patch(url, json=payload)
+    with httpx.Client(headers=_headers(api_key), timeout=30.0) as client:
+        resp = client.post(f"{NOTION_API_BASE}/pages", json=payload)
         resp.raise_for_status()
 
 
@@ -134,120 +148,314 @@ def update_page_status(api_key: str, page_id: str, status: str = "To Do") -> Non
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def parse_pages(raw_pages: list[dict[str, Any]]) -> list[NotionPage]:
-    """Convert raw Notion API results into typed NotionPage objects."""
-    pages: list[NotionPage] = []
+def _get_title(props: dict[str, Any]) -> str:
+    """Extract plain text title from Notion properties."""
+    for prop_name in ("Projects", "Title"):
+        prop = props.get(prop_name)
+        if isinstance(prop, dict):
+            items = prop.get("title", [])
+            if items and isinstance(items, list):
+                return "".join(
+                    item.get("plain_text", "")
+                    for item in items
+                    if isinstance(item, dict)
+                ).strip()
+    return ""
+
+
+def _get_select_name(props: dict[str, Any], prop_name: str) -> str:
+    """Extract the name of a select property."""
+    obj = props.get(prop_name)
+    if isinstance(obj, dict):
+        sel = obj.get("select")
+        if isinstance(sel, dict):
+            return sel.get("name", "")
+    return ""
+
+
+def _get_rich_text(props: dict[str, Any], prop_name: str) -> str:
+    """Extract plain text from a rich_text property."""
+    obj = props.get(prop_name)
+    if isinstance(obj, dict):
+        items = obj.get("rich_text", [])
+        if isinstance(items, list):
+            return "".join(
+                item.get("plain_text", "")
+                for item in items
+                if isinstance(item, dict)
+            ).strip()
+    return ""
+
+
+def _get_date(props: dict[str, Any], prop_name: str) -> date | None:
+    """Extract a date from a date property."""
+    obj = props.get(prop_name)
+    if isinstance(obj, dict):
+        d = obj.get("date")
+        if isinstance(d, dict):
+            raw = d.get("start")
+            if raw:
+                try:
+                    return datetime.strptime(raw, "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+    return None
+
+
+def parse_problems(raw_pages: list[dict[str, Any]]) -> list[Problem]:
+    """Convert raw Notion results into Problem objects."""
+    problems = []
     for entry in raw_pages:
         props = entry.get("properties", {})
 
-        # Title from Projects property (id="title", type="title")
-        title_prop = props.get("Projects", {})
-        title_list: list[Any] = []
-        if isinstance(title_prop, dict):
-            title_list = title_prop.get("title", [])
-        title = ""
-        if isinstance(title_list, list):
-            title = "".join(item.get("plain_text", "") for item in title_list if isinstance(item, dict))
-
-        # Score (select)
         score_obj = props.get("Score", {})
-        score_label = score_obj.get("select", {}).get("name", "") if isinstance(score_obj, dict) else ""
+        score_label = (
+            score_obj.get("select", {}).get("name", "")
+            if isinstance(score_obj, dict)
+            else ""
+        )
 
-        # Status (select)
-        status_obj = props.get("Status", {})
-        status = status_obj.get("select", {}).get("name", "") if isinstance(status_obj, dict) else ""
+        last_reviewed_obj = props.get("Last Reviewed", {})
+        last_reviewed_str = ""
+        if isinstance(last_reviewed_obj, dict):
+            d = last_reviewed_obj.get("date")
+            if isinstance(d, dict):
+                last_reviewed_str = d.get("start", "")
 
-        # Times done (number)
-        times_done_prop = props.get("Times done", {})
-        times_done: int | None = None
-        if isinstance(times_done_prop, dict):
-            raw_num = times_done_prop.get("number")
-            if raw_num is not None:
-                times_done = int(raw_num)
+        last_reviewed: date | None = None
+        if last_reviewed_str:
+            try:
+                last_reviewed = datetime.strptime(last_reviewed_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
 
-        # Last edit to page (last_edited_time) - value is a string timestamp
-        last_edit_prop = props.get("Last edit to page", {})
-        last_edit_str = ""
-        if isinstance(last_edit_prop, dict):
-            raw_val = last_edit_prop.get("last_edited_time")
-            if isinstance(raw_val, str):
-                last_edit_str = raw_val
-            elif isinstance(raw_val, dict):
-                last_edit_str = raw_val.get("time", "")
-
-        last_edited = datetime.fromisoformat(last_edit_str.replace("Z", "+00:00")) if last_edit_str else datetime.now(timezone.utc)
-
-        # Link (rich_text)
-        link_obj = props.get("Link", {})
-        link_text = ""
-        if isinstance(link_obj, dict):
-            rich_text_list = link_obj.get("rich_text", [])
-            if isinstance(rich_text_list, list):
-                link_text = "".join(item.get("plain_text", "") for item in rich_text_list if isinstance(item, dict))
-
-        pages.append(NotionPage(
+        problems.append(Problem(
             page_id=entry.get("id", ""),
-            title=title.strip(),
+            title=_get_title(props),
+            status=_get_select_name(props, "Status"),
             score_label=score_label,
-            status=status,
-            times_done=times_done,
-            last_edited=last_edited,
-            link_text=link_text.strip(),
+            last_reviewed=last_reviewed,
+            link_text=_get_rich_text(props, "Link"),
         ))
 
-    return pages
+    return problems
+
+
+def parse_existing_reviews(
+    raw_pages: list[dict[str, Any]], problem_map: dict[str, Problem]
+) -> dict[str, list[ReviewLog]]:
+    """
+    Convert existing review DB entries into per-problem ReviewLog lists.
+
+    Returns a dict mapping problem page_id -> sorted list of ReviewLog.
+    """
+    reviews_by_problem: dict[str, list[ReviewLog]] = {}
+
+    for entry in raw_pages:
+        props = entry.get("properties", {})
+
+        # Get linked problem via 'Leetcode' relation
+        leetcode_rel = props.get("Leetcode", {})
+        if not isinstance(leetcode_rel, dict):
+            continue
+        relations = leetcode_rel.get("relation", [])
+
+        # Get review date
+        date_obj = props.get("Date", {})
+        date_str = ""
+        if isinstance(date_obj, dict):
+            d = date_obj.get("date")
+            if isinstance(d, dict):
+                date_str = d.get("start", "")
+
+        if not date_str:
+            continue
+
+        try:
+            review_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        # Get score -> rating
+        select_obj = props.get("Select", {})
+        score_label = ""
+        if isinstance(select_obj, dict):
+            sel = select_obj.get("select")
+            if isinstance(sel, dict):
+                score_label = sel.get("name", "")
+
+        if not score_label or score_label not in SCORE_TO_RATING:
+            continue
+
+        rating = SCORE_TO_RATING[score_label]
+
+        for rel in relations:
+            if not isinstance(rel, dict):
+                continue
+            pid = rel.get("id", "")
+            if pid not in problem_map:
+                continue
+
+            reviews_by_problem.setdefault(pid, []).append(
+                ReviewLog(
+                    card_id=hash(pid) & 0xFFFFFFFF,
+                    rating=rating,
+                    review_datetime=review_dt,
+                    review_duration=None,
+                )
+            )
+
+    for pid in reviews_by_problem:
+        reviews_by_problem[pid].sort(key=lambda r: r.review_datetime)
+
+    return reviews_by_problem
+
+
+def build_existing_reviews_index(
+    raw_reviews: list[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    """
+    Build a set of (problem_id, date_str) tuples for all existing review entries.
+
+    Used to check if a problem's Last Reviewed + Score combo already has a DB entry,
+    so we don't create duplicates.
+    """
+    seen: set[tuple[str, str]] = set()
+
+    for entry in raw_reviews:
+        props = entry.get("properties", {})
+
+        leetcode_rel = props.get("Leetcode", {})
+        if not isinstance(leetcode_rel, dict):
+            continue
+        relations = leetcode_rel.get("relation", [])
+
+        date_obj = props.get("Date", {})
+        date_str = ""
+        if isinstance(date_obj, dict):
+            d = date_obj.get("date")
+            if isinstance(d, dict):
+                date_str = d.get("start", "")
+
+        for rel in relations:
+            if not isinstance(rel, dict):
+                continue
+            pid = rel.get("id", "")
+            if date_str:
+                seen.add((pid, date_str))
+
+    return seen
+
+
+# ---------------------------------------------------------------------------
+# Review sync: auto-create missing entries from problems
+# ---------------------------------------------------------------------------
+
+def sync_reviews(
+    api_key: str,
+    problems: list[Problem],
+    existing_index: set[tuple[str, str]],
+) -> int:
+    """
+    For each problem that has Last Reviewed + Score, ensure a review entry exists.
+
+    Returns the number of new entries created.
+    """
+    created = 0
+    for p in problems:
+        if not p.last_reviewed or not p.score_label:
+            continue
+
+        date_str = p.last_reviewed.isoformat()
+        key = (p.page_id, date_str)
+
+        if key not in existing_index:
+            try:
+                create_review_entry(api_key, p.page_id, p.score_label, p.last_reviewed)
+                existing_index.add(key)
+                created += 1
+            except httpx.HTTPStatusError as e:
+                print(f"Warning: Failed to sync review for '{p.title}': {e}", file=sys.stderr)
+
+    return created
+
+
+def problem_to_review_log(p: Problem) -> ReviewLog | None:
+    """Convert a problem's Last Reviewed + Score into a single ReviewLog."""
+    if not p.last_reviewed or not p.score_label:
+        return None
+
+    rating = SCORE_TO_RATING.get(p.score_label)
+    if not rating:
+        return None
+
+    review_dt = datetime(
+        p.last_reviewed.year,
+        p.last_reviewed.month,
+        p.last_reviewed.day,
+        tzinfo=timezone.utc,
+    )
+
+    return ReviewLog(
+        card_id=hash(p.page_id) & 0xFFFFFFFF,
+        rating=rating,
+        review_datetime=review_dt,
+        review_duration=None,
+    )
 
 
 # ---------------------------------------------------------------------------
 # FSRS ranking logic
 # ---------------------------------------------------------------------------
 
-def compute_priority(page: NotionPage, now: datetime) -> RankedCard:
+def build_card(problem_id: str, review_logs: list[ReviewLog]) -> Card:
+    """Build FSRS card state from review history."""
+    card = Card(card_id=hash(problem_id) & 0xFFFFFFFF)
+    if review_logs:
+        card = _fsrs.reschedule_card(card, review_logs)
+    return card
+
+
+def rank_problems(
+    problems: list[Problem],
+    reviews_by_problem: dict[str, list[ReviewLog]],
+    now: datetime | None = None,
+) -> list[RankedCard]:
     """
-    Compute review priority using a simplified FSRS model.
+    Rank problems by review urgency using full FSRS.
 
-    Since we only have aggregate data (Times done, current Score), not per-review history,
-    we use these proxies to estimate urgency:
-
-    - Cards not reviewed in >14 days are high priority
-    - Lower Score = higher urgency (FAILED worst, 5 best)
-    - Higher Times done with low Score = repeat offender (higher priority)
+    Priority formula:
+    - Overdue cards (due <= now): high priority, scaled by days overdue + forgetfulness
+    - New cards (no reviews): low baseline priority
     """
-    # Days since last review
-    delta = now - page.last_edited
-    days_since = max(delta.days, 0)
-
-    # Base priority from time decay: exponential increase after 14-day threshold
-    time_threshold = 14
-    time_factor = max(0, (days_since - time_threshold)) ** 2 / 100.0
-
-    # Score urgency: map to numeric where FAILED=0 is worst
-    score_value_map = {"FAILED": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5}
-    score_val = score_value_map.get(page.score_label, 3)
-    # Invert: lower score = higher urgency (5 - val gives 5 for FAILED, 0 for score 5)
-    score_factor = (5 - score_val) * 2.0
-
-    # Repeat offender factor: more attempts with low score = more urgent
-    repeat_factor = 0.0
-    if page.times_done is not None and page.times_done > 0:
-        repeat_factor = min(page.times_done * 0.5, 5.0)
-
-    # Combine factors
-    priority = time_factor + score_factor + repeat_factor
-
-    return RankedCard(
-        priority_score=round(priority, 4),
-        page=page,
-        days_since_review=days_since if days_since > 0 else None,
-    )
-
-
-def rank_cards(pages: list[NotionPage], now: datetime | None = None) -> list[RankedCard]:
-    """Rank cards by review priority (highest first)."""
     if now is None:
         now = datetime.now(timezone.utc)
 
-    ranked = [compute_priority(page, now) for page in pages]
+    ranked: list[RankedCard] = []
+
+    for p in problems:
+        logs = reviews_by_problem.get(p.page_id, [])
+        card = build_card(p.page_id, logs)
+        retrievability = _fsrs.get_card_retrievability(card, now)
+
+        if not logs:
+            priority = 0.5
+        else:
+            if card.due and card.due <= now:
+                days_overdue = (now - card.due).days
+                priority = round(
+                    0.5 + min(days_overdue * 0.1, 2.0) + (1.0 - retrievability), 6
+                )
+            else:
+                priority = round(retrievability - 0.5, 6)
+
+        ranked.append(RankedCard(
+            priority_score=priority,
+            card=card,
+            problem=p,
+            review_count=len(logs),
+        ))
+
     ranked.sort(key=lambda c: c.priority_score, reverse=True)
     return ranked
 
@@ -256,18 +464,34 @@ def rank_cards(pages: list[NotionPage], now: datetime | None = None) -> list[Ran
 # Output helpers
 # ---------------------------------------------------------------------------
 
+def _state_label(card: Card) -> str:
+    from fsrs import State
+    names = {
+        State.Learning: "Learning",
+        State.Review: "Review",
+        State.Relearning: "Relearn",
+    }
+    return names.get(card.state, f"Unknown({card.state})")
+
+
 def format_card(card: RankedCard, index: int) -> str:
     """Format a single ranked card for stdout output."""
-    p = card.page
-    days_str = f"{card.days_since_review}d" if card.days_since_review else "never"
-    times_str = f"{p.times_done}" if p.times_done is not None else "N/A"
+    p = card.problem
+    c = card.card
+    d_str = f"{c.difficulty:.2f}" if c.difficulty is not None else "N/A"
+    s_str = f"{c.stability:.1f}d" if c.stability is not None else "N/A"
+
     lines = [
         f"  {index}. {p.title}",
-        f"     Score: {p.score_label} | Times done: {times_str} | Last review: {days_str} ago",
-        f"     Priority: {card.priority_score}",
+        f"     State: {_state_label(c)} | D: {d_str} | S: {s_str} | Reviews: {card.review_count}",
     ]
+
+    if c.due:
+        lines.append(f"     Due: {c.due.strftime('%Y-%m-%d')}")
+
     if p.link_text:
         lines.append(f"     Link: {p.link_text}")
+
     return "\n".join(lines)
 
 
@@ -277,7 +501,7 @@ def print_results(cards: list[RankedCard]) -> None:
         print("No review items found.")
         return
 
-    print(f"\nTop {len(cards)} review items:\n")
+    print(f"\nTop {len(cards)} review items (most urgent first):\n")
     for i, card in enumerate(cards, 1):
         print(format_card(card, i))
         print()
@@ -289,7 +513,9 @@ def print_results(cards: list[RankedCard]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Rank LeetCode problems by FSRS review priority and set daily To Do items."
+        description=(
+            "Rank LeetCode problems by FSRS review priority and set daily To Do items."
+        )
     )
     parser.add_argument(
         "-n", type=int, default=3,
@@ -297,7 +523,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print ranked items without updating Notion Status",
+        help="Print ranked items without updating Notion Status or syncing reviews",
     )
     return parser.parse_args(argv)
 
@@ -306,49 +532,66 @@ def main(argv: list[str] | None = None) -> int:
     """Main entry point. Returns exit code."""
     args = parse_args(argv)
 
-    # Load environment variables from .env file
     load_dotenv()
     api_key = os.getenv("NOTION_API_KEY")
     if not api_key:
-        print("Error: NOTION_API_KEY not set. Add it to .env or export it.", file=sys.stderr)
+        print(
+            "Error: NOTION_API_KEY not set. Add it to .env or export it.",
+            file=sys.stderr,
+        )
         return 1
 
-    # Step 1: Query all pages from DB
+    # Step 1: Fetch problems and existing reviews
     try:
-        raw_pages = fetch_all_pages(api_key)
+        raw_problems = fetch_all_pages(api_key, PROBLEMS_DB_ID)
+        raw_reviews = fetch_all_pages(api_key, REVIEWS_DB_ID)
     except httpx.HTTPStatusError as e:
-        print(f"Error querying Notion database: {e}", file=sys.stderr)
+        print(f"Error querying Notion: {e}", file=sys.stderr)
         return 1
 
-    if not raw_pages:
-        print("No pages found in database.", file=sys.stderr)
+    problems = parse_problems(raw_problems)
+    problem_map = {p.page_id: p for p in problems}
+
+    # Step 2: Parse existing reviews from Reviews DB
+    reviews_by_problem = parse_existing_reviews(raw_reviews, problem_map)
+
+    # Step 3: Auto-sync missing review entries (unless dry-run)
+    if not args.dry_run:
+        existing_index = build_existing_reviews_index(raw_reviews)
+        new_count = sync_reviews(api_key, problems, existing_index)
+        if new_count:
+            print(f"Synced {new_count} new review(s) from Problems DB.\n")
+
+            # Re-fetch reviews to include newly created ones
+            raw_reviews = fetch_all_pages(api_key, REVIEWS_DB_ID)
+            reviews_by_problem = parse_existing_reviews(raw_reviews, problem_map)
+
+    # Step 4: Filter out already-To-Do cards
+    candidates = [p for p in problems if p.status != "To Do"]
+
+    if not candidates:
+        print("No candidate problems (all To Do or DB empty).")
         return 0
 
-    # Step 2: Parse and filter out "To Do" cards
-    all_pages = parse_pages(raw_pages)
-    candidate_pages = [p for p in all_pages if p.status != "To Do"]
+    ranked = rank_problems(candidates, reviews_by_problem)
+    top_n = ranked[: args.n]
 
-    if not candidate_pages:
-        print("No candidate pages (all already To Do or DB empty).")
-        return 0
-
-    # Step 3: Apply FSRS ranking
-    ranked = rank_cards(candidate_pages)
-    top_n = ranked[:args.n]
-
-    # Step 4: Print results
+    # Step 5: Print results
     print_results(top_n)
 
-    # Step 5: Update Status to "To Do" (unless dry-run)
+    # Step 6: Update Status to "To Do" (unless dry-run)
     if args.dry_run:
         print("[DRY RUN] Skipping Notion updates.\n")
     else:
         for card in top_n:
             try:
-                update_page_status(api_key, card.page.page_id)
-                print(f"Updated '{card.page.title}' -> To Do")
+                update_page_status(api_key, card.problem.page_id, "To Do")
+                print(f"Updated '{card.problem.title}' -> To Do")
             except httpx.HTTPStatusError as e:
-                print(f"Warning: Failed to update '{card.page.title}': {e}", file=sys.stderr)
+                print(
+                    f"Warning: Failed to update '{card.problem.title}': {e}",
+                    file=sys.stderr,
+                )
 
     return 0
 
