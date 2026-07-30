@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ REVIEWS_DB_ID = "3ad974f8b66a80eca299e6c937c3a6bc"
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 PAGE_SIZE = 100
+CACHE_FILE = "cache.json"
 
 SCORE_TO_RATING: dict[str, Rating] = {
     "FAILED": Rating.Again,
@@ -241,110 +243,64 @@ def parse_problems(raw_pages: list[dict[str, Any]]) -> list[Problem]:
     return problems
 
 
-def parse_existing_reviews(
-    raw_pages: list[dict[str, Any]], problem_map: dict[str, Problem]
-) -> dict[str, list[ReviewLog]]:
-    """
-    Convert existing review DB entries into per-problem ReviewLog lists.
+# ---------------------------------------------------------------------------
+# Local cache: avoid re-fetching reviews on every run
+# ---------------------------------------------------------------------------
 
-    Returns a dict mapping problem page_id -> sorted list of ReviewLog.
+CacheEntry = dict[str, str]  # {"date": "YYYY-MM-DD", "score": "FAILED|1..5"}
+CacheData = dict[str, CacheEntry]  # problem_id -> entry
+
+
+def load_cache() -> tuple[CacheData, dict[str, list[ReviewLog]]]:
     """
+    Load cached review data from disk.
+
+    Returns (cache_entries, reviews_by_problem) where cache_entries maps
+    problem_id -> {date, score} and reviews_by_problem is the parsed ReviewLog map.
+    """
+    if not os.path.exists(CACHE_FILE):
+        return {}, {}
+
+    try:
+        with open(CACHE_FILE) as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}, {}
+
+    cache: CacheData = {}
     reviews_by_problem: dict[str, list[ReviewLog]] = {}
 
-    for entry in raw_pages:
-        props = entry.get("properties", {})
-
-        # Get linked problem via 'Leetcode' relation
-        leetcode_rel = props.get("Leetcode", {})
-        if not isinstance(leetcode_rel, dict):
+    for pid, entry in raw.items():
+        if not isinstance(entry, dict) or "date" not in entry:
             continue
-        relations = leetcode_rel.get("relation", [])
-
-        # Get review date
-        date_obj = props.get("Date", {})
-        date_str = ""
-        if isinstance(date_obj, dict):
-            d = date_obj.get("date")
-            if isinstance(d, dict):
-                date_str = d.get("start", "")
-
-        if not date_str:
+        cache[pid] = entry
+        rating = SCORE_TO_RATING.get(entry.get("score", ""))
+        if not rating:
             continue
-
         try:
-            review_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            review_dt = datetime.strptime(entry["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             continue
 
-        # Get score -> rating
-        select_obj = props.get("Select", {})
-        score_label = ""
-        if isinstance(select_obj, dict):
-            sel = select_obj.get("select")
-            if isinstance(sel, dict):
-                score_label = sel.get("name", "")
-
-        if not score_label or score_label not in SCORE_TO_RATING:
-            continue
-
-        rating = SCORE_TO_RATING[score_label]
-
-        for rel in relations:
-            if not isinstance(rel, dict):
-                continue
-            pid = rel.get("id", "")
-            if pid not in problem_map:
-                continue
-
-            reviews_by_problem.setdefault(pid, []).append(
-                ReviewLog(
-                    card_id=hash(pid) & 0xFFFFFFFF,
-                    rating=rating,
-                    review_datetime=review_dt,
-                    review_duration=None,
-                )
+        reviews_by_problem.setdefault(pid, []).append(
+            ReviewLog(
+                card_id=hash(pid) & 0xFFFFFFFF,
+                rating=rating,
+                review_datetime=review_dt,
+                review_duration=None,
             )
+        )
 
     for pid in reviews_by_problem:
         reviews_by_problem[pid].sort(key=lambda r: r.review_datetime)
 
-    return reviews_by_problem
+    return cache, reviews_by_problem
 
 
-def build_existing_reviews_index(
-    raw_reviews: list[dict[str, Any]],
-) -> set[tuple[str, str]]:
-    """
-    Build a set of (problem_id, date_str) tuples for all existing review entries.
-
-    Used to check if a problem's Last Reviewed + Score combo already has a DB entry,
-    so we don't create duplicates.
-    """
-    seen: set[tuple[str, str]] = set()
-
-    for entry in raw_reviews:
-        props = entry.get("properties", {})
-
-        leetcode_rel = props.get("Leetcode", {})
-        if not isinstance(leetcode_rel, dict):
-            continue
-        relations = leetcode_rel.get("relation", [])
-
-        date_obj = props.get("Date", {})
-        date_str = ""
-        if isinstance(date_obj, dict):
-            d = date_obj.get("date")
-            if isinstance(d, dict):
-                date_str = d.get("start", "")
-
-        for rel in relations:
-            if not isinstance(rel, dict):
-                continue
-            pid = rel.get("id", "")
-            if date_str:
-                seen.add((pid, date_str))
-
-    return seen
+def save_cache(cache: CacheData) -> None:
+    """Persist cache to disk."""
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +310,12 @@ def build_existing_reviews_index(
 def sync_reviews(
     api_key: str,
     problems: list[Problem],
-    existing_index: set[tuple[str, str]],
+    cache: CacheData,
+    reviews_by_problem: dict[str, list[ReviewLog]],
 ) -> int:
     """
-    For each problem that has Last Reviewed + Score, ensure a review entry exists.
+    Compare each problem's Last Reviewed + Score against the local cache.
+    For any new or changed reviews, create a Notion entry and update cache + logs.
 
     Returns the number of new entries created.
     """
@@ -367,41 +325,39 @@ def sync_reviews(
             continue
 
         date_str = p.last_reviewed.isoformat()
-        key = (p.page_id, date_str)
+        cached = cache.get(p.page_id)
 
-        if key not in existing_index:
-            try:
-                create_review_entry(api_key, p.page_id, p.score_label, p.last_reviewed)
-                existing_index.add(key)
-                created += 1
-            except httpx.HTTPStatusError as e:
-                print(f"Warning: Failed to sync review for '{p.title}': {e}", file=sys.stderr)
+        # Only create if the Last Reviewed date has changed (or no prior cache entry)
+        cached_date = cached.get("date") if isinstance(cached, dict) else None
+        if cached_date == date_str:
+            continue  # already synced
+
+        try:
+            create_review_entry(api_key, p.page_id, p.score_label, p.last_reviewed)
+        except httpx.HTTPStatusError as e:
+            print(f"Warning: Failed to sync review for '{p.title}': {e}", file=sys.stderr)
+            continue
+
+        # Update cache and in-memory review logs
+        cache[p.page_id] = {"date": date_str, "score": p.score_label}
+        created += 1
+
+        rating = SCORE_TO_RATING.get(p.score_label)
+        if rating:
+            review_dt = datetime(
+                p.last_reviewed.year, p.last_reviewed.month,
+                p.last_reviewed.day, tzinfo=timezone.utc,
+            )
+            reviews_by_problem.setdefault(p.page_id, []).append(
+                ReviewLog(
+                    card_id=hash(p.page_id) & 0xFFFFFFFF,
+                    rating=rating,
+                    review_datetime=review_dt,
+                    review_duration=None,
+                )
+            )
 
     return created
-
-
-def problem_to_review_log(p: Problem) -> ReviewLog | None:
-    """Convert a problem's Last Reviewed + Score into a single ReviewLog."""
-    if not p.last_reviewed or not p.score_label:
-        return None
-
-    rating = SCORE_TO_RATING.get(p.score_label)
-    if not rating:
-        return None
-
-    review_dt = datetime(
-        p.last_reviewed.year,
-        p.last_reviewed.month,
-        p.last_reviewed.day,
-        tzinfo=timezone.utc,
-    )
-
-    return ReviewLog(
-        card_id=hash(p.page_id) & 0xFFFFFFFF,
-        rating=rating,
-        review_datetime=review_dt,
-        review_duration=None,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +484,85 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _seed_cache_from_notion(
+    api_key: str,
+    problems: list[Problem],
+) -> tuple[CacheData, dict[str, list[ReviewLog]]]:
+    """
+    First-run seed: fetch all reviews from Notion and build the local cache.
+
+    Returns (cache_data, reviews_by_problem).
+    """
+    raw_reviews = fetch_all_pages(api_key, REVIEWS_DB_ID)
+    problem_map = {p.page_id: p for p in problems}
+
+    cache: CacheData = {}
+    reviews_by_problem: dict[str, list[ReviewLog]] = {}
+
+    for entry in raw_reviews:
+        props = entry.get("properties", {})
+
+        # Linked problem via 'Leetcode' relation
+        leetcode_rel = props.get("Leetcode", {})
+        if not isinstance(leetcode_rel, dict):
+            continue
+        relations = leetcode_rel.get("relation", [])
+
+        # Review date
+        date_obj = props.get("Date", {})
+        date_str = ""
+        if isinstance(date_obj, dict):
+            d = date_obj.get("date")
+            if isinstance(d, dict):
+                date_str = d.get("start", "")
+
+        if not date_str:
+            continue
+
+        try:
+            review_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        # Score -> rating
+        select_obj = props.get("Select", {})
+        score_label = ""
+        if isinstance(select_obj, dict):
+            sel = select_obj.get("select")
+            if isinstance(sel, dict):
+                score_label = sel.get("name", "")
+
+        if not score_label or score_label not in SCORE_TO_RATING:
+            continue
+
+        rating = SCORE_TO_RATING[score_label]
+
+        for rel in relations:
+            if not isinstance(rel, dict):
+                continue
+            pid = rel.get("id", "")
+            if pid not in problem_map:
+                continue
+
+            # Keep latest review per problem in cache
+            if pid not in cache or date_str > cache[pid].get("date", ""):
+                cache[pid] = {"date": date_str, "score": score_label}
+
+            reviews_by_problem.setdefault(pid, []).append(
+                ReviewLog(
+                    card_id=hash(pid) & 0xFFFFFFFF,
+                    rating=rating,
+                    review_datetime=review_dt,
+                    review_duration=None,
+                )
+            )
+
+    for pid in reviews_by_problem:
+        reviews_by_problem[pid].sort(key=lambda r: r.review_datetime)
+
+    return cache, reviews_by_problem
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entry point. Returns exit code."""
     args = parse_args(argv)
@@ -541,32 +576,38 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # Step 1: Fetch problems and existing reviews
-    try:
-        raw_problems = fetch_all_pages(api_key, PROBLEMS_DB_ID)
-        raw_reviews = fetch_all_pages(api_key, REVIEWS_DB_ID)
-    except httpx.HTTPStatusError as e:
-        print(f"Error querying Notion: {e}", file=sys.stderr)
-        return 1
+    # Step 1: Load local cache (avoids re-fetching reviews DB)
+    cache, reviews_by_problem = load_cache()
 
-    problems = parse_problems(raw_problems)
-    problem_map = {p.page_id: p for p in problems}
+    # If no cache exists, seed from Notion's Reviews DB once
+    if not cache:
+        try:
+            raw_problems = fetch_all_pages(api_key, PROBLEMS_DB_ID)
+        except httpx.HTTPStatusError as e:
+            print(f"Error querying Notion: {e}", file=sys.stderr)
+            return 1
 
-    # Step 2: Parse existing reviews from Reviews DB
-    reviews_by_problem = parse_existing_reviews(raw_reviews, problem_map)
+        problems = parse_problems(raw_problems)
+        cache, reviews_by_problem = _seed_cache_from_notion(api_key, problems)
+        save_cache(cache)
+    else:
+        # Normal run: just fetch problems (reviews come from cache + delta sync)
+        try:
+            raw_problems = fetch_all_pages(api_key, PROBLEMS_DB_ID)
+        except httpx.HTTPStatusError as e:
+            print(f"Error querying Notion: {e}", file=sys.stderr)
+            return 1
 
-    # Step 3: Auto-sync missing review entries (unless dry-run)
+        problems = parse_problems(raw_problems)
+
+    # Step 2: Auto-sync new reviews (unless dry-run) - only creates deltas
     if not args.dry_run:
-        existing_index = build_existing_reviews_index(raw_reviews)
-        new_count = sync_reviews(api_key, problems, existing_index)
+        new_count = sync_reviews(api_key, problems, cache, reviews_by_problem)
         if new_count:
             print(f"Synced {new_count} new review(s) from Problems DB.\n")
+            save_cache(cache)
 
-            # Re-fetch reviews to include newly created ones
-            raw_reviews = fetch_all_pages(api_key, REVIEWS_DB_ID)
-            reviews_by_problem = parse_existing_reviews(raw_reviews, problem_map)
-
-    # Step 4: Filter out already-To-Do cards
+    # Step 3: Filter out already-To-Do cards
     candidates = [p for p in problems if p.status != "To Do"]
 
     if not candidates:
@@ -576,10 +617,10 @@ def main(argv: list[str] | None = None) -> int:
     ranked = rank_problems(candidates, reviews_by_problem)
     top_n = ranked[: args.n]
 
-    # Step 5: Print results
+    # Step 4: Print results
     print_results(top_n)
 
-    # Step 6: Update Status to "To Do" (unless dry-run)
+    # Step 5: Update Status to "To Do" (unless dry-run)
     if args.dry_run:
         print("[DRY RUN] Skipping Notion updates.\n")
     else:
