@@ -1,0 +1,43 @@
+name: Notion FSRS Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_items:
+        description: "Number of items to select"
+        required: false
+        default: "3"
+      dry_run:
+        description: "Dry run (preview only, no Notion updates)"
+        required: false
+        default: "false"
+
+# Optional: uncomment for automatic daily runs at 8am UTC
+# schedule:
+#   - cron: '0 8 * * *'
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Run review scheduler
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          uv run python main.py -n ${{ github.event.inputs.num_items }} $DRY_RUN_FLAG
